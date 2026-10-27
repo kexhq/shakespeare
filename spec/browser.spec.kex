@@ -11,7 +11,7 @@ describe("Shakespeare browser") do
 
   it("fills, clicks and waits for a browser change") do
     let router = Net.HTTP.Router.build.get("/", do |_, _|
-      Net.HTTP.Response.binary(200, "<title>Shakespeare test</title><input id='name' aria-label='Name'><button id='go'>Go</button><p id='out'></p><script>document.querySelector('#go').addEventListener('click', () => { document.querySelector('#out').textContent = document.querySelector('#name').value })</script>".to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
+      Net.HTTP.Response.binary(200, "<title>Shakespeare test</title><style>#reveal button { display:none } #reveal:hover button { display:block }</style><div id='reveal'>Hover here<button id='revealed'>Revealed</button></div><input id='name' aria-label='Name'><button id='go'>Go</button><p id='out'></p><script>document.querySelector('#go').addEventListener('click', () => { document.querySelector('#out').textContent = document.querySelector('#name').value })</script>".to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
     end)
     let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
     let server = Net.HTTP.Server.start(endpoint, router).try
@@ -23,6 +23,8 @@ describe("Shakespeare browser") do
       page.goto("http://127.0.0.1:${port}/").try
       Assert.equal(page.url(), Ok("http://127.0.0.1:${port}/"))
       Assert.equal(page.title(), Ok("Shakespeare test"))
+      page.locator("#reveal").hover().try
+      Shakespeare.expect(page.locator("#revealed")).toBeVisible()
       page.getByRole("textbox", "Name").fill("Ada").try
       Shakespeare.expect(page.getByRole("textbox", "Name")).toHaveValue("Ada")
       page.getByRole("button", "Go").click().try

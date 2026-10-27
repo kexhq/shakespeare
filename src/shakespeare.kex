@@ -383,9 +383,26 @@ foul unhighlight(page: Page) -> Void do
 end
 
 make Locator do
+  # Move the pointer over an element, revealing hover controls as a user does.
+  foul hover() -> Void or! String do
+    waitFor(this, "hover", true).try
+    scrollIntoView(this).try
+    let target = waitFor(this, "hover", true).try
+    note(@page, "hover ${locatorLabel(this)}")
+    highlight(@page, target)
+    cdpRequest(@page.transport, @page.sessionId, "Input.dispatchMouseEvent",
+      { "type": "mouseMoved", x: field(target, "x"), y: field(target, "y") }, @page.options.timeoutMs).try
+    unhighlight(@page)
+    evidence(@page, "hover")
+    Ok(())
+  end
+
   foul click() -> Void or! String do
     waitFor(this, "click", true).try
     scrollIntoView(this).try
+    let initial = waitFor(this, "click", true).try
+    cdpRequest(@page.transport, @page.sessionId, "Input.dispatchMouseEvent",
+      { "type": "mouseMoved", x: field(initial, "x"), y: field(initial, "y") }, @page.options.timeoutMs).try
     let target = waitFor(this, "click", true).try
     let x = field(target, "x")
     let y = field(target, "y")
