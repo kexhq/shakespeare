@@ -1,0 +1,46 @@
+using Shakespeare
+using Net.HTTP, only: [Server]
+
+content : Integer -> String
+foul content(count) = "<p id=\"count\">${count}</p><button type=\"button\" data-event=\"increment\">Add one</button>"
+
+page : Integer -> String
+foul page(count) = "<!doctype html><html><body><main id=\"app\">${content(count)}</main><span id=\"status\" data-state=\"connecting\"></span><script src=\"${Metro.Live.Client.address}\"></script></body></html>"
+
+describe("Metro Live in a browser") do
+  it("connects to a live socket and renders an interaction") do
+    let hub = Process.spawn(Metro.Live.Hub.Hub {})
+    let live = Metro.Router.live("/live", do |_, socket|
+      Metro.Live.Socket.attached(
+        socket,
+        hub,
+        "browser-example",
+        0,
+        do |count, event|
+          if Metro.Live.Socket.named(event) == "increment"
+            Metro.Live.Socket.unchanged(count + 1)
+          else
+            Metro.Live.Socket.unchanged(count)
+          end
+        end,
+        do |count| content(count) end
+      )
+    end)
+    let routes = Metro.Router.define do
+      Metro.Router.get("/", do |request| request.html(page(0)) end)
+      live
+      Metro.Live.Client.route()
+    end
+    let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
+    let server = Server.start(endpoint, routes.httpRouter).try
+    let port = server.localAddress.port.value
+    Shakespeare.withPage(Shakespeare.Options {}) do |browserPage|
+      browserPage.goto("http://127.0.0.1:${port}/").try
+      Shakespeare.expect(browserPage.locator("#status")).toHaveText("Live")
+      Shakespeare.expect(browserPage.locator("#count")).toHaveText("0")
+      browserPage.getByRole("button", "Add one").click().try
+      Shakespeare.expect(browserPage.locator("#count")).toHaveText("1")
+    end
+    server.stop().try
+  end
+end

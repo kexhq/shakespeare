@@ -1,0 +1,6 @@
+package "shakespeare" do
+  version("0.1.0")
+  description("Browser tests for Kex")
+  kex(">= 0.4.0-rc.3")
+  license("LGPL-3.0-or-later")
+end

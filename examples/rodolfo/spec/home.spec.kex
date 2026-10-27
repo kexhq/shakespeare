@@ -1,0 +1,24 @@
+using Rodolfo
+using Shakespeare
+using Net.HTTP, only: [Server]
+
+describe("Rodolfo in a browser") do
+  it("runs a page script after a click") do
+    let site = Rodolfo.router do
+      get "/" do
+        Response.HTML {
+          body: "<input id='name'><button id='go'>Greet</button><p id='answer'></p><script>document.querySelector('#go').onclick = () => { document.querySelector('#answer').textContent = 'Hello, ' + document.querySelector('#name').value }</script>"
+        }
+      end
+    end
+    let server = site.background(0).try
+    let port = server.localAddress.port.value
+    Shakespeare.withPage(Shakespeare.Options {}) do |page|
+      page.goto("http://127.0.0.1:${port}/").try
+      page.locator("#name").fill("Ada").try
+      page.locator("#go").click().try
+      Shakespeare.expect(page.locator("#answer")).toHaveText("Hello, Ada")
+    end
+    server.stop().try
+  end
+end

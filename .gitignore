@@ -1,0 +1,5 @@
+/.tey/
+/_build/
+/artifacts/
+/ebin/
+*.beam

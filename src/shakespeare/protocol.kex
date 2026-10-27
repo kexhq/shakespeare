@@ -1,0 +1,54 @@
+# A serial Chrome DevTools Protocol transport. One Kex process owns the
+# socket, so replies and events cannot be consumed by competing callers.
+module Shakespeare.Protocol
+
+using Net.HTTP.WebSocket, only: [Connection, Text, CloseMessage]
+
+record State do
+  socket : Connection
+  nextId : Integer = 1
+end
+
+serving State do
+  foul slot exchange(session: String, method: String, params: Any,
+               timeoutMs: Integer) -> Reply<Any or! String> do
+    let id = @nextId
+    new.nextId = id + 1
+    let envelope = { id: id, method: method, params: params }
+    let message = session.empty? then envelope else envelope.put(:sessionId, session)
+    match @socket.send(Text(JSON.stringify(message))) do
+      Error(error) => return { new, reply: Error("CDP send ${method}: ${error}") }
+      Ok(_) => ()
+    end
+    let deadline = DateTime.epochNanos() / 1000000 + timeoutMs
+    loop do
+      let remaining = deadline - DateTime.epochNanos() / 1000000
+      if remaining <= 0
+        return { new, reply: Error("CDP ${method} timed out after ${timeoutMs} ms") }
+      end
+      match @socket.receiveMessage(timeout: Just(Duration.milliseconds(remaining))) do
+        Error(error) => return { new, reply: Error("CDP receive ${method}: ${error}") }
+        Ok(CloseMessage(_, reason)) => return { new, reply: Error("browser closed: ${reason}") }
+        Ok(Text(body)) => do
+          let document = match JSON.parse(body) do
+            Error(_) => return { new, reply: Error("browser sent invalid JSON") }
+            Ok(value) => value
+          end
+          if document["id"] == Just(id)
+            match document["error"] do
+              Just(problem) => return { new, reply: Error("CDP ${method}: ${problem}") }
+              None => ()
+            end
+            return { new, reply: Ok(document["result"].or({})) }
+          end
+        end
+        Ok(_) => ()
+      end
+    end
+  end
+
+  foul slot close -> Void do
+    @socket.close
+    return new
+  end
+end

@@ -1,0 +1,39 @@
+using Net.HTTP, only: [Headers]
+
+describe("Shakespeare browser") do
+  it("opens Chrome and evaluates a page") do
+    let browser = Shakespeare.start().try
+    let page = browser.newPage().try
+    Assert.equal(page.evaluate("1 + 1"), Ok(2))
+    page.close
+    browser.close
+  end
+
+  it("fills, clicks and waits for a browser change") do
+    let router = Net.HTTP.Router.build.get("/", do |_, _|
+      Net.HTTP.Response.binary(200, "<title>Shakespeare test</title><input id='name' aria-label='Name'><button id='go'>Go</button><p id='out'></p><script>document.querySelector('#go').addEventListener('click', () => { document.querySelector('#out').textContent = document.querySelector('#name').value })</script>".to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
+    end)
+    let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
+    let server = Net.HTTP.Server.start(endpoint, router).try
+    let port = Net.HTTP.Server.localAddress(server).port.value
+    Shakespeare.withPage(Shakespeare.Options {
+      watch?: ENV.get("SHAKESPEARE_WATCH") == Just("1"),
+      slowMs: 100
+    }) do |page|
+      page.goto("http://127.0.0.1:${port}/").try
+      Assert.equal(page.url(), Ok("http://127.0.0.1:${port}/"))
+      Assert.equal(page.title(), Ok("Shakespeare test"))
+      page.getByRole("textbox", "Name").fill("Ada").try
+      Shakespeare.expect(page.getByRole("textbox", "Name")).toHaveValue("Ada")
+      page.getByRole("button", "Go").click().try
+      Shakespeare.expect(page.locator("#out")).toHaveText("Ada")
+      let shot = FS.Path.join(FS.Directory.temporary, "shakespeare-${Random.token(8)}.png")
+      page.screenshot(shot).try
+      Assert.truthy(FS.File.readBytes(shot).map { |bytes| bytes.length > 100 }.or(false))
+      FS.File.delete(shot)
+      page.reload().try
+      Shakespeare.expect(page.getByRole("button", "Go")).toBeVisible()
+    end
+    Net.HTTP.Server.stop(server).try
+  end
+end
