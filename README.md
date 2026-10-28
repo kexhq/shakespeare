@@ -52,9 +52,28 @@ there is no need for a fixed sleep after a Live update.
 
 Use `page.getByRole("button", "Sign in")` to locate a control by its role and
 accessible name, or `page.getByText("Signed in")` for exact text on a leaf
-element. CSS, role, and text locators must match exactly one element before an
-action runs. Click and fill bring their target into view before acting. The
-default timeout is ten seconds; set `timeoutMs` in `Options` for slower flows.
+element. Narrow any locator to the matches containing some text with
+`withText`, as in `page.locator(".sidebar button").withText("Eve")`. CSS, role,
+and text locators must match exactly one element before an action runs. Text is
+compared as it is read: runs of whitespace count as one space.
+
+| Action | |
+| --- | --- |
+| `click()`, `hover()` | move the pointer to the element; click presses there |
+| `fill(text)` | replace a text control's value; `fill("")` empties it |
+| `write(text)` | insert text at the caret, keeping what is there |
+| `press(key)` | press `Enter`, `Escape`, `Tab`, arrows…, or a chord such as `Shift+Enter` |
+| `select(choice)` | choose a `<select>` option by value or label |
+
+Actions bring their target into view first. `text()`, `value()` and `count()`
+read the page once; expectations retry until the timeout: `toHaveText`,
+`toContainText`, `toHaveValue`, `toHaveCount`, `toBeVisible` and
+`toBeHidden`. The default timeout is ten seconds; set `timeoutMs` in `Options`
+for slower flows.
+
+`page.newPage()` opens another page in a browser context of its own, sharing
+no cookies or storage with the first: a second person, signed in separately.
+`withPage` closes it with the browser.
 
 ## Watch a test
 
@@ -87,13 +106,16 @@ mode.
 
 The browser is discovered from `CHROME_PATH` or common macOS and Linux
 locations. Set `browserPath` in `Options` for another executable location.
-Shakespeare creates a separate temporary Chrome profile for every browser
-and removes it on close.
+Shakespeare creates a separate temporary Chrome profile for every browser.
+Closing the browser waits for Chrome to exit and removes the profile. Chrome
+runs under a small shell supervisor, so a test run that is interrupted or
+killed outright does not leave Chrome or its profile behind either.
 
 ## Current coverage
 
-Chromium navigation, URL and title reads, CSS, role and exact text locators,
-click, fill, page evaluation, reload, screenshots, and retrying text, input
-value, and visibility assertions.
+Chromium navigation and reload, URL and title reads, CSS, role and exact text
+locators narrowed by text, click, hover, fill, write, key presses, select,
+isolated pages, page evaluation, screenshots, and retrying text, value, count
+and visibility assertions.
 Browser commands are serialized. Cross-browser engines, network interception,
 downloads, frames, and tracing are future work.

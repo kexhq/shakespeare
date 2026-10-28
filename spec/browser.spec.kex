@@ -1,41 +1,159 @@
 using Net.HTTP, only: [Headers]
 
+# Serve one page of HTML at `/` for the length of a case.
+foul hosting(html: String, work: String -> Any) -> Void do
+  let router = Net.HTTP.Router.build.get("/", do |_, _|
+    Net.HTTP.Response.binary(200, html.to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
+  end)
+  let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
+  let server = Net.HTTP.Server.start(endpoint, router).try
+  let port = Net.HTTP.Server.localAddress(server).port.value
+  work("http://127.0.0.1:${port}/")
+  Net.HTTP.Server.stop(server).try
+  ()
+end
+
+foul options(timeoutMs: Integer) -> Shakespeare.Options = Shakespeare.Options {
+  watch?: ENV.get("SHAKESPEARE_WATCH") == Just("1"),
+  slowMs: 100,
+  timeoutMs: timeoutMs
+}
+
+let interactive = [
+  "<title>Shakespeare test</title>",
+  "<style>#reveal button { display:none } #reveal:hover button { display:block }</style>",
+  "<div id='reveal'>Hover here<button id='revealed'>Revealed</button></div>",
+  "<input id='name' aria-label='Name'><button id='go'>Go</button><p id='out'></p>",
+  "<script>document.querySelector('#go').addEventListener('click', () => {",
+  "  document.querySelector('#out').textContent = document.querySelector('#name').value })</script>"
+].join("\n")
+
+let keyboard = [
+  "<form id='form'><input id='line' name='line' value='kept'><textarea id='notes'></textarea></form>",
+  "<p id='submitted'></p><p id='keys'></p>",
+  "<select id='mood' aria-label='Mood'><option value=''>None</option><option value='sun'>Sunny</option></select>",
+  "<p id='chosen'></p>",
+  "<script>",
+  "document.querySelector('#form').addEventListener('submit', e => {",
+  "  e.preventDefault(); document.querySelector('#submitted').textContent = document.querySelector('#line').value })",
+  "document.querySelector('#notes').addEventListener('keydown', e => {",
+  "  document.querySelector('#keys').textContent += (e.shiftKey ? 'Shift+' : '') + e.key + ' ' })",
+  "document.querySelector('#mood').addEventListener('change', e => {",
+  "  document.querySelector('#chosen').textContent = e.target.value })",
+  "</script>"
+].join("\n")
+
+let listing = [
+  "<ul id='people'>",
+  "  <li><button>Ada</button></li>",
+  "  <li><button>Bob   Builder</button></li>",
+  "  <li hidden><button>Eve</button></li>",
+  "</ul>",
+  "<p id='spaced'>",
+  "  Several   words,",
+  "  on lines",
+  "</p>",
+  "<p id='later'></p>",
+  "<script>setTimeout(() => { document.querySelector('#later').textContent = 'arrived late' }, 300)</script>"
+].join("\n")
+
 describe("Shakespeare browser") do
   it("opens Chrome and evaluates a page") do
     let browser = Shakespeare.start().try
     let page = browser.newPage().try
     Assert.equal(page.evaluate("1 + 1"), Ok(2))
+    Assert.truthy(page.evaluate("missing()").error?)
     page.close
     browser.close
   end
 
+  it("stops Chrome and removes its profile when closed") do
+    let browser = Shakespeare.start().try
+    let profile = browser.profile
+    Assert.truthy(FS.Directory.exists?(profile))
+    browser.close
+    Assert.falsy(FS.Directory.exists?(profile))
+    let running = Process.run("pgrep", ["-f", profile]).map { |result| result.stdout.trim }.or("")
+    Assert.equal(running, "")
+  end
+
   it("fills, clicks and waits for a browser change") do
-    let router = Net.HTTP.Router.build.get("/", do |_, _|
-      Net.HTTP.Response.binary(200, "<title>Shakespeare test</title><style>#reveal button { display:none } #reveal:hover button { display:block }</style><div id='reveal'>Hover here<button id='revealed'>Revealed</button></div><input id='name' aria-label='Name'><button id='go'>Go</button><p id='out'></p><script>document.querySelector('#go').addEventListener('click', () => { document.querySelector('#out').textContent = document.querySelector('#name').value })</script>".to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
-    end)
-    let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
-    let server = Net.HTTP.Server.start(endpoint, router).try
-    let port = Net.HTTP.Server.localAddress(server).port.value
-    Shakespeare.withPage(Shakespeare.Options {
-      watch?: ENV.get("SHAKESPEARE_WATCH") == Just("1"),
-      slowMs: 100
-    }) do |page|
-      page.goto("http://127.0.0.1:${port}/").try
-      Assert.equal(page.url(), Ok("http://127.0.0.1:${port}/"))
-      Assert.equal(page.title(), Ok("Shakespeare test"))
-      page.locator("#reveal").hover().try
-      Shakespeare.expect(page.locator("#revealed")).toBeVisible()
-      page.getByRole("textbox", "Name").fill("Ada").try
-      Shakespeare.expect(page.getByRole("textbox", "Name")).toHaveValue("Ada")
-      page.getByRole("button", "Go").click().try
-      Shakespeare.expect(page.locator("#out")).toHaveText("Ada")
-      let shot = FS.Path.join(FS.Directory.temporary, "shakespeare-${Random.token(8)}.png")
-      page.screenshot(shot).try
-      Assert.truthy(FS.File.readBytes(shot).map { |bytes| bytes.length > 100 }.or(false))
-      FS.File.delete(shot)
-      page.reload().try
-      Shakespeare.expect(page.getByRole("button", "Go")).toBeVisible()
+    hosting(interactive) do |base|
+      Shakespeare.withPage(options(3000)) do |page|
+        page.goto(base).try
+        Assert.equal(page.url(), Ok(base))
+        Assert.equal(page.title(), Ok("Shakespeare test"))
+        page.locator("#reveal").hover().try
+        Shakespeare.expect(page.locator("#revealed")).toBeVisible()
+        page.getByRole("textbox", "Name").fill("Ada").try
+        Shakespeare.expect(page.getByRole("textbox", "Name")).toHaveValue("Ada")
+        page.getByRole("button", "Go").click().try
+        Shakespeare.expect(page.locator("#out")).toHaveText("Ada")
+        page.getByRole("textbox", "Name").fill("").try
+        Shakespeare.expect(page.getByRole("textbox", "Name")).toHaveValue("")
+        let shot = FS.Path.join(FS.Directory.temporary, "shakespeare-${Random.token(8)}.png")
+        page.screenshot(shot).try
+        Assert.truthy(FS.File.readBytes(shot).map { |bytes| bytes.length > 100 }.or(false))
+        FS.File.delete(shot)
+        page.reload().try
+        Shakespeare.expect(page.locator("#out")).toHaveText("")
+        Shakespeare.expect(page.getByRole("button", "Go")).toBeVisible()
+      end
     end
-    Net.HTTP.Server.stop(server).try
+  end
+
+  it("types, presses keys and chooses options") do
+    hosting(keyboard) do |base|
+      Shakespeare.withPage(options(3000)) do |page|
+        page.goto(base).try
+        page.locator("#line").write(" and more").try
+        Shakespeare.expect(page.locator("#line")).toHaveValue("kept and more")
+        page.locator("#line").press("Enter").try
+        Shakespeare.expect(page.locator("#submitted")).toHaveText("kept and more")
+        page.locator("#notes").write("first").try
+        page.locator("#notes").press("Shift+Enter").try
+        page.locator("#notes").write("second").try
+        Shakespeare.expect(page.locator("#notes")).toHaveValue("first\nsecond")
+        page.locator("#notes").press("Escape").try
+        Shakespeare.expect(page.locator("#keys")).toHaveText("Shift+Enter Escape")
+        Assert.truthy(page.locator("#notes").press("Hyper+Enter").error?)
+        Assert.truthy(page.locator("#notes").press("Nonsense").error?)
+        page.getByRole("combobox", "Mood").select("Sunny").try
+        Shakespeare.expect(page.locator("#chosen")).toHaveText("sun")
+        Assert.truthy(page.locator("#mood").select("Rainy").error?)
+      end
+    end
+  end
+
+  it("narrows, counts and compares text as it is read") do
+    hosting(listing) do |base|
+      Shakespeare.withPage(options(3000)) do |page|
+        page.goto(base).try
+        Shakespeare.expect(page.locator("#spaced")).toHaveText("Several words, on lines")
+        Shakespeare.expect(page.locator("#spaced")).toContainText("words, on")
+        Shakespeare.expect(page.locator("#people button")).toHaveCount(3)
+        Shakespeare.expect(page.locator("#people button").withText("Bob Builder")).toBeVisible()
+        Shakespeare.expect(page.locator("#people button").withText("Eve")).toBeHidden()
+        Shakespeare.expect(page.locator("#people button").withText("Mallory")).toHaveCount(0)
+        Shakespeare.expect(page.getByText("Bob Builder")).toBeVisible()
+        Shakespeare.expect(page.locator("#later")).toHaveText("arrived late")
+        Assert.truthy(page.locator("#people button").click().error?)
+        Assert.equal(page.locator("#people button").withText("Ada").text(), Ok("Ada"))
+      end
+    end
+  end
+
+  it("keeps each page's cookies to itself") do
+    hosting(interactive) do |base|
+      Shakespeare.withPage(options(3000)) do |page|
+        page.goto(base).try
+        page.evaluate("document.cookie = 'visitor=first'").try
+        let other = page.newPage().try
+        other.goto(base).try
+        Assert.equal(other.evaluate("document.cookie"), Ok(""))
+        Assert.equal(page.evaluate("document.cookie"), Ok("visitor=first"))
+        other.close
+      end
+    end
   end
 end

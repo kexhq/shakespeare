@@ -17,13 +17,15 @@ record Browser do
   transport : Server<State>
   runner : Process<Any>
   profile : String
-  contextId : String
   options : Options
   artifacts : String
 end
 
+# One tab in a browser context of its own: pages share nothing — cookies,
+# storage, or a signed-in session — so two pages are two visitors.
 record Page do
   transport : Server<State>
+  contextId : String
   sessionId : String
   targetId : String
   options : Options
@@ -35,51 +37,14 @@ record Locator do
   kind : String
   query : String
   name : String = ""
+  hasText : String = ""
 end
 
 record Expectation do
   locator : Locator
 end
 
-# Parsed CDP responses contain ordinary Kex maps. Keep dynamic access in one
-# place, and check missing fields before showing them to callers.
-let field(value: Any, name: String) -> Any do
-  match Kex.Intrinsic.Map.get(value, name) do
-    Just(found) => found
-    None => None
-  end
-end
-let string(value: Any, name: String) -> String = "${field(value, name)}"
-foul cdpRequest(transport: Server<State>, session: String, method: String,
-            params: Any, timeoutMs: Integer) -> Any or! String do
-  match transport.exchange(session, method, params, timeoutMs, within: timeoutMs + 2000) do
-    Ok(value) => value
-    Error(error) => Error("CDP ${method}: ${error}")
-  end
-end
-
-foul executable(options: Options) -> String do
-  let candidates = [
-    options.browserPath,
-    ENV.get("CHROME_PATH").or(""),
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser"
-  ]
-  candidates.find { |candidate| !candidate.empty? && FS.File.file?(candidate) }.or("")
-end
-
-foul stopChrome(profile: String) -> Void do
-  match Process.run("pkill", ["-f", profile]) do
-    Ok(_) => ()
-    Error(_) => ()
-  end
-end
-
-launch : Options -> Browser or! String
-foul launch(options: Options) do
+foul launch(options: Options) -> Browser or! String do
   let path = executable(options)
   return Error("Chrome or Chromium was not found; set CHROME_PATH or browserPath") if path.empty?
   let profile = FS.Directory.createTemporary("shakespeare").or("")
@@ -89,96 +54,68 @@ foul launch(options: Options) do
     "--remote-allow-origins=*",
     "--user-data-dir=${profile}",
     "--no-first-run", "--no-default-browser-check",
-    "--disable-background-networking", "about:blank"
+    "--disable-background-networking",
+    "--autoplay-policy=no-user-gesture-required",
+    "about:blank"
   ]
-  let args = options.watch? then arguments else ["--headless=new", ...arguments]
-  # The Kex process keeps the OS child alive while the test continues. The
-  # shell only redirects diagnostics; all values arrive as separate argv.
-  let script = "profile=\"$1\"; shift; exec \"$0\" \"$@\" >\"$profile/browser.log\" 2>&1"
+  let flags = options.watch? then arguments else ["--headless=new", ...arguments]
   let runner: Process<Any> = spawn do
-    Process.stream("sh", ["-c", script, path, profile, ...args])
+    Process.stream("sh", ["-c", supervisor, path, profile, ...flags])
   end
   let portFile = FS.Path.join(profile, "DevToolsActivePort")
-  let deadline = DateTime.epochNanos() / 1000000 + options.timeoutMs
-  while !FS.File.file?(portFile) && DateTime.epochNanos() / 1000000 < deadline do
-    Task.sleep(Duration.milliseconds(50))
+  let deadline = epochMs() + options.timeoutMs
+  while !FS.File.file?(portFile) && epochMs() < deadline do
+    pause(50)
   end
   if !FS.File.file?(portFile)
     let log = FS.File.read(FS.Path.join(profile, "browser.log")).or("")
-    stopChrome(profile)
-    FS.Directory.deleteAll(profile)
+    abandon(profile, None)
     return Error("Chrome did not open its debugging endpoint: ${log}")
   end
   let lines = FS.File.read(portFile).or("").trim.split("\n")
   let port = lines.first.or("")
   let endpoint = lines.second.or("")
-  let socket = WebSocket.connect("ws://127.0.0.1:${port}${endpoint}")
-  let connection = match socket do
+  let connection = match WebSocket.connect("ws://127.0.0.1:${port}${endpoint}") do
+    Ok(value) => value
     Error(error) => do
-      stopChrome(profile)
-      FS.Directory.deleteAll(profile)
+      abandon(profile, None)
       return Error("could not connect to Chrome: ${error}")
     end
-    Ok(value) => value
   end
   let transport = Process.spawn(State { socket: connection })
-  let context = match cdpRequest(
-    transport, "", "Target.createBrowserContext", {}, options.timeoutMs
-  ) do
-    Ok(value) => value
+  let artifacts = match artifactDirectory(options) do
+    Ok(directory) => directory
     Error(reason) => do
-      transport.close
-      stopChrome(profile)
-      FS.Directory.deleteAll(profile)
-      return Error("could not create a browser context: ${reason}")
+      abandon(profile, Just(transport))
+      return Error(reason)
     end
   end
-  let contextId = string(context, "browserContextId")
-  let artifacts = if options.watch?
-    options.artifacts.empty? then
-      FS.Directory.createTemporary("shakespeare-watch").or("")
-    else
-      options.artifacts
-  else
-    options.artifacts
-  end
-  if !artifacts.empty?
-    if !FS.Directory.exists?(artifacts) && !FS.Directory.create(artifacts)
-      transport.close
-      stopChrome(profile)
-      FS.Directory.deleteAll(profile)
-      return Error("could not create artifact directory ${artifacts}")
-    end
-    if options.watch?
-      IO.printError("Shakespeare watch artifacts: ${artifacts}")
-    end
-  end
-  Ok(Browser { transport: transport, runner: runner, profile: profile, contextId: contextId,
-               options: options, artifacts: artifacts })
+  Ok(Browser {
+    transport: transport,
+    runner: runner,
+    profile: profile,
+    options: options,
+    artifacts: artifacts
+  })
 end
 
-start : Browser or! String
-foul start() = launch(Options {})
+foul start() -> Browser or! String = launch(Options {})
 
 make Browser do
-  foul newPage() -> Page or! String do
-    let made = cdpRequest(@transport, "", "Target.createTarget",
-      { url: "about:blank", browserContextId: @contextId }, @options.timeoutMs).try
-    let targetId = string(made, "targetId")
-    let attached = cdpRequest(@transport, "", "Target.attachToTarget",
-      { targetId: targetId, flatten: true }, @options.timeoutMs).try
-    let sessionId = string(attached, "sessionId")
-    cdpRequest(@transport, sessionId, "Page.enable", {}, @options.timeoutMs).try
-    cdpRequest(@transport, sessionId, "Runtime.enable", {}, @options.timeoutMs).try
-    return Ok(Page { transport: @transport, sessionId: sessionId,
-      targetId: targetId, options: @options, artifacts: @artifacts })
-  end
+  foul newPage() -> Page or! String = openPage(@transport, @options, @artifacts)
 
+  # Ask Chrome to quit and wait for it, so the next browser does not start
+  # beside this one; stop it outright if it does not go.
   foul close() -> Void do
-    cdpRequest(@transport, "", "Target.disposeBrowserContext",
-      { browserContextId: @contextId }, @options.timeoutMs)
     cdpRequest(@transport, "", "Browser.close", {}, @options.timeoutMs)
     @transport.close
+    let deadline = epochMs() + 5000
+    while @runner.alive? && epochMs() < deadline do
+      pause(50)
+    end
+    if @runner.alive?
+      stopChrome(@profile)
+    end
     FS.Directory.deleteAll(@profile)
     ()
   end
@@ -191,59 +128,43 @@ make Page do
     page: this, kind: "role", query: role, name: name
   }
 
+  # A second visitor in the same browser: a page in a context of its own.
+  foul newPage() -> Page or! String = openPage(@transport, @options, @artifacts)
+
   foul evaluate(expression: String) -> Any or! String do
-    let answer = cdpRequest(@transport, @sessionId, "Runtime.evaluate",
-      { expression: expression, returnByValue: true, awaitPromise: true },
-      @options.timeoutMs).try
-    if field(answer, "exceptionDetails") != None
-      return Error("page script failed: ${field(answer, "exceptionDetails")}")
+    let answer = command(this, "Runtime.evaluate",
+      { expression: expression, returnByValue: true, awaitPromise: true }).try
+    let failure = field(answer, "exceptionDetails")
+    if failure != None
+      let thrown = string(field(failure, "exception"), "description")
+      return Error("page script failed: ${thrown.empty? then string(failure, "text") else thrown}")
     end
-    return Ok(field(field(answer, "result"), "value"))
+    Ok(field(field(answer, "result"), "value"))
   end
 
-  foul url() -> String or! String do
-    Ok("${this.evaluate("location.href").try}")
-  end
+  foul url() -> String or! String = Ok("${this.evaluate("location.href").try}")
 
-  foul title() -> String or! String do
-    Ok("${this.evaluate("document.title").try}")
-  end
+  foul title() -> String or! String = Ok("${this.evaluate("document.title").try}")
 
   foul goto(url: String) -> Void or! String do
     note(this, "goto ${url}")
-    let before = this.evaluate("({url: location.href, origin: performance.timeOrigin})").or({})
-    let answer = cdpRequest(@transport, @sessionId, "Page.navigate",
-      { url: url }, @options.timeoutMs).try
-    if field(answer, "errorText") != None
-      return Error("navigation failed: ${field(answer, "errorText")}")
-    end
-    let deadline = DateTime.epochNanos() / 1000000 + @options.timeoutMs
-    loop do
-      let state = this.evaluate("({url: location.href, origin: performance.timeOrigin, ready: document.readyState === 'complete'})").or({})
-      let addressChanged = field(state, "url") != field(before, "url")
-      let loadChanged = field(state, "origin") != field(before, "origin")
-      let changed = addressChanged || loadChanged
-      if field(state, "ready") == true && changed
-        note(this, "loaded ${url}")
-        evidence(this, "goto")
-        if @options.watch?
-          Task.sleep(Duration.milliseconds(@options.slowMs))
-        end
-        return Ok(())
-      end
-      return Error("navigation to ${url} timed out") if DateTime.epochNanos() / 1000000 >= deadline
-      Task.sleep(Duration.milliseconds(50))
-    end
+    let before = this.evaluate(documentState).or({})
+    let answer = command(this, "Page.navigate", { url: url }).try
+    let failure = string(answer, "errorText")
+    return Error("navigation to ${url} failed: ${failure}") if !failure.empty?
+    awaitLoad(this, before, url)
   end
 
   foul reload() -> Void or! String do
-    let here = this.evaluate("location.href").try
-    return this.goto("${here}")
+    let before = this.evaluate(documentState).try
+    note(this, "reload")
+    command(this, "Page.reload", {}).try
+    awaitLoad(this, before, string(before, "url"))
   end
 
   foul screenshot(path: String) -> Void or! String do
-    let result = cdpRequest(@transport, @sessionId, "Page.captureScreenshot",
-      { format: "png", captureBeyondViewport: false }, @options.timeoutMs).try
+    let result = command(this, "Page.captureScreenshot",
+      { format: "png", captureBeyondViewport: false }).try
     let bytes = Binary.fromBase64(string(result, "data")).or(Binary.empty)
     return Error("browser returned an invalid screenshot") if bytes.length == 0
     return Error("could not write screenshot ${path}") if FS.File.writeBytes(path, bytes).error?
@@ -252,185 +173,91 @@ make Page do
 
   foul close() -> Void do
     cdpRequest(@transport, "", "Target.closeTarget", { targetId: @targetId }, @options.timeoutMs)
+    cdpRequest(@transport, "", "Target.disposeBrowserContext",
+      { browserContextId: @contextId }, @options.timeoutMs)
     ()
   end
 end
 
-# In-page scripts are small and deterministic; selector text is JSON quoted.
-let lookup(locator: Locator) -> String do
-  let candidates = locatorCandidates(locator)
-  return "(() => { const nodes = ${candidates}; return nodes.map(e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return {text: e.textContent.trim(), visible: r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none', enabled: !e.disabled && e.getAttribute('aria-disabled') !== 'true', x: r.x + r.width / 2, y: r.y + r.height / 2, width: r.width, height: r.height}; }); })()"
-end
-
-let locatorCandidates(locator: Locator) -> String do
-  let query = JSON.stringify(locator.query)
-  if locator.kind == "css"
-    return "Array.from(document.querySelectorAll(${query}))"
-  end
-  if locator.kind == "text"
-    return "Array.from(document.querySelectorAll('body *')).filter(e => e.children.length === 0 && e.textContent.trim() === ${query})"
-  end
-  let name = JSON.stringify(locator.name)
-  "Array.from(document.querySelectorAll('body *')).filter(e => { const type = (e.getAttribute('type') || 'text').toLowerCase(); const implicit = e.tagName === 'BUTTON' ? 'button' : e.tagName === 'A' && e.hasAttribute('href') ? 'link' : e.tagName === 'TEXTAREA' ? 'textbox' : e.tagName === 'SELECT' ? 'combobox' : /^H[1-6]$/.test(e.tagName) ? 'heading' : e.tagName === 'IMG' ? 'img' : e.tagName === 'INPUT' ? ({text:'textbox',email:'textbox',search:'searchbox',tel:'textbox',url:'textbox',password:'textbox',checkbox:'checkbox',radio:'radio',number:'spinbutton',button:'button',submit:'button',reset:'button'}[type] || '') : ''; const role = e.getAttribute('role') || implicit; const refs = e.getAttribute('aria-labelledby'); const labelledBy = refs ? refs.trim().split(' ').map(id => document.getElementById(id)).filter(Boolean).map(node => (node.innerText || node.textContent || '').trim()).join(' ') : ''; const labels = e.labels ? Array.from(e.labels).map(label => (label.innerText || label.textContent || '').trim()).join(' ') : ''; const accessibleName = labelledBy || e.getAttribute('aria-label') || labels || e.getAttribute('alt') || (e.innerText || '').trim() || e.getAttribute('value') || e.getAttribute('title') || e.getAttribute('placeholder') || ''; return role === ${query} && accessibleName === ${name}; })"
-end
-
-let element(locator: Locator) -> String do
-  "${locatorCandidates(locator)}[0]"
-end
-
-let locatorLabel(locator: Locator) -> String do
-  if locator.kind == "role"
-    return "role `${locator.query}` named `${locator.name}`"
-  end
-  "${locator.kind} `${locator.query}`"
-end
-
-foul scrollIntoView(locator: Locator) -> Void or! String do
-  let selector = element(locator)
-  let scrolled = locator.page.evaluate(
-    "(() => { const e = ${selector}; if (!e) return false; e.scrollIntoView({ block: 'center', inline: 'center' }); return true; })()"
-  ).try
-  return Error("${locatorLabel(locator)} disappeared before the action") if scrolled != true
-  Ok(())
-end
-
-foul found(locator: Locator) -> [Any] or! String do
-  let value = locator.page.evaluate(lookup(locator)).try
-  let entries: [Any] = value
-  Ok(entries)
-end
-
-foul waitFor(locator: Locator, action: String, requireEnabled: Bool) -> Any or! String do
-  let deadline = DateTime.epochNanos() / 1000000 + locator.page.options.timeoutMs
-  var last = "no match"
-  loop do
-    let matches = found(locator).try
-    if matches.count == 1
-      let matchValue = matches.first.or({})
-      if (field(matchValue, "visible") == true && (!requireEnabled || field(matchValue, "enabled") == true))
-        return Ok(matchValue)
-      end
-      last = "the matching element is hidden or disabled"
-    elif matches.count > 1
-      return Error(
-        "${action}: ${locatorLabel(locator)} matched ${matches.count} elements"
-      )
-    end
-    if DateTime.epochNanos() / 1000000 >= deadline
-      return Error("${action}: ${locatorLabel(locator)} timed out (${last})")
-    end
-    Task.sleep(Duration.milliseconds(50))
-  end
-end
-
-foul note(page: Page, description: String) -> Void do
-  if !page.options.watch?
-    return ()
-  end
-  IO.printError("Shakespeare: ${description}")
-  if !page.artifacts.empty?
-    let line = "${DateTime.epochNanos()} ${description}\n"
-    FS.File.append(FS.Path.join(page.artifacts, "actions.log"), line)
-  end
-end
-
-foul evidence(page: Page, label: String) -> Void do
-  if page.options.watch? && !page.artifacts.empty?
-    let path = FS.Path.join(page.artifacts, "${DateTime.epochNanos()}-${label}.png")
-    page.screenshot(path)
-  end
-end
-
-foul failureEvidence(page: Page) -> Void do
-  let directory = page.artifacts.empty? then
-    FS.Directory.createTemporary("shakespeare-failure").or("")
-  else
-    page.artifacts
-  if directory.empty?
-    return ()
-  end
-  let screenshot = FS.Path.join(directory, "failure.png")
-  let document = FS.Path.join(directory, "page.html")
-  let address = FS.Path.join(directory, "url.txt")
-  page.screenshot(screenshot)
-  match page.evaluate("document.documentElement.outerHTML") do
-    Ok(html) => do FS.File.write(document, "${html}") () end
-    Error(_) => ()
-  end
-  match page.evaluate("location.href") do
-    Ok(url) => do FS.File.write(address, "${url}\n") () end
-    Error(_) => ()
-  end
-  IO.printError("Shakespeare failure evidence: ${directory}")
-end
-
-foul highlight(page: Page, target: Any) -> Void do
-  if !page.options.watch?
-    return ()
-  end
-  cdpRequest(page.transport, page.sessionId, "Overlay.enable", {}, page.options.timeoutMs)
-  cdpRequest(page.transport, page.sessionId, "Overlay.highlightRect",
-    { x: field(target, "x"), y: field(target, "y"),
-      width: field(target, "width"), height: field(target, "height"),
-      color: { r: 50, g: 150, b: 255, a: 0.25 } }, page.options.timeoutMs)
-  Task.sleep(Duration.milliseconds(page.options.slowMs))
-end
-
-foul unhighlight(page: Page) -> Void do
-  if page.options.watch?
-    cdpRequest(page.transport, page.sessionId, "Overlay.hideHighlight", {}, page.options.timeoutMs)
-  end
-end
-
 make Locator do
+  # Only the matches whose text contains `text`, whitespace collapsed.
+  let withText(text: String) -> Locator = Locator { ...this, hasText: text }
+
   # Move the pointer over an element, revealing hover controls as a user does.
   foul hover() -> Void or! String do
-    waitFor(this, "hover", true).try
-    scrollIntoView(this).try
-    let target = waitFor(this, "hover", true).try
-    note(@page, "hover ${locatorLabel(this)}")
-    highlight(@page, target)
-    cdpRequest(@page.transport, @page.sessionId, "Input.dispatchMouseEvent",
-      { "type": "mouseMoved", x: field(target, "x"), y: field(target, "y") }, @page.options.timeoutMs).try
+    let target = actionable(this, "hover").try
+    mouse(@page, "mouseMoved", target).try
     unhighlight(@page)
     evidence(@page, "hover")
     Ok(())
   end
 
   foul click() -> Void or! String do
-    waitFor(this, "click", true).try
-    scrollIntoView(this).try
-    let initial = waitFor(this, "click", true).try
-    cdpRequest(@page.transport, @page.sessionId, "Input.dispatchMouseEvent",
-      { "type": "mouseMoved", x: field(initial, "x"), y: field(initial, "y") }, @page.options.timeoutMs).try
-    let target = waitFor(this, "click", true).try
-    let x = field(target, "x")
-    let y = field(target, "y")
-    note(@page, "click ${locatorLabel(this)}")
-    highlight(@page, target)
-    cdpRequest(@page.transport, @page.sessionId, "Input.dispatchMouseEvent",
-      { "type": "mousePressed", x: x, y: y, button: "left", clickCount: 1 }, @page.options.timeoutMs).try
-    cdpRequest(@page.transport, @page.sessionId, "Input.dispatchMouseEvent",
-      { "type": "mouseReleased", x: x, y: y, button: "left", clickCount: 1 }, @page.options.timeoutMs).try
+    let target = actionable(this, "click").try
+    mouse(@page, "mouseMoved", target).try
+    # Hover styles can move the element; press where it is now.
+    let settled = waitFor(this, "click", true).try
+    mouse(@page, "mousePressed", settled).try
+    mouse(@page, "mouseReleased", settled).try
     unhighlight(@page)
     evidence(@page, "click")
     Ok(())
   end
 
+  # Replace a text control's value as typing would, firing input events.
   foul fill(text: String) -> Void or! String do
-    waitFor(this, "fill", true).try
-    scrollIntoView(this).try
-    let target = waitFor(this, "fill", true).try
-    note(@page, "fill ${locatorLabel(this)}")
-    highlight(@page, target)
+    actionable(this, "fill").try
     let selector = element(this)
-    let focused = @page.evaluate("(() => { const e = ${selector}; if (!e || !('value' in e)) return false; e.focus(); e.select(); return true; })()").try
-    return Error("fill: ${locatorLabel(this)} is not a text input") if focused != true
-    cdpRequest(@page.transport, @page.sessionId, "Input.insertText", { text: text }, @page.options.timeoutMs).try
+    let selected = @page.evaluate(
+      "(() => { const e = ${selector}; if (!e || !('value' in e)) return false; e.focus(); e.select(); return true; })()"
+    ).try
+    return Error("fill: ${locatorLabel(this)} is not a text input") if selected != true
+    if text.empty?
+      pressKey(@page, "Delete").try
+    else
+      command(@page, "Input.insertText", { text: text }).try
+    end
     unhighlight(@page)
     evidence(@page, "fill")
     Ok(())
   end
+
+  # Type at the caret without clearing the control first, as a person
+  # continuing to write does.
+  foul write(text: String) -> Void or! String do
+    actionable(this, "write").try
+    focus(this, "write").try
+    command(@page, "Input.insertText", { text: text }).try
+    unhighlight(@page)
+    evidence(@page, "write")
+    Ok(())
+  end
+
+  # Choose the option of a `<select>` whose value or label is `choice`.
+  foul select(choice: String) -> Void or! String do
+    actionable(this, "select").try
+    let selector = element(this)
+    let wanted = JSON.stringify(choice)
+    let chosen = @page.evaluate(
+      "(() => { const e = ${selector}; if (!e || e.tagName !== 'SELECT') return 'not a select'; const o = Array.from(e.options).find(o => o.value === ${wanted} || o.label.trim() === ${wanted}); if (!o) return 'no option'; e.value = o.value; e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); return 'chosen'; })()"
+    ).try
+    return Error("select: ${locatorLabel(this)}: ${chosen} `${choice}`") if chosen != "chosen"
+    unhighlight(@page)
+    evidence(@page, "select")
+    Ok(())
+  end
+
+  # Press a key, or a chord such as `Shift+Enter`, with this element focused.
+  foul press(key: String) -> Void or! String do
+    actionable(this, "press").try
+    focus(this, "press").try
+    pressKey(@page, key).try
+    unhighlight(@page)
+    evidence(@page, "press")
+    Ok(())
+  end
+
+  foul count() -> Integer or! String = Ok(found(this).try.count)
 
   foul text() -> String or! String do
     let matches = found(this).try
@@ -454,77 +281,38 @@ let expect(locator: Locator) -> Expectation = Expectation { locator: locator }
 
 make Expectation do
   foul toHaveText(expected: String) -> Void do
-    let deadline = DateTime.epochNanos() / 1000000 + @locator.page.options.timeoutMs
-    var actual = "<missing>"
-    loop do
-      match found(@locator) do
-        Error(_) => ()
-        Ok(matches) when matches.count > 1 => do
-          evidence(@locator.page, "failure")
-          assert(false, "${locatorLabel(@locator)} matched ${matches.count} elements")
-          ()
-        end
-        Ok(matches) when matches.count == 1 => do
-          actual = string(matches.first.or({}), "text")
-          if actual == expected
-            return ()
-          end
-        end
-        _ => ()
-      end
-      if DateTime.epochNanos() / 1000000 >= deadline
-        evidence(@locator.page, "failure")
-        assert(false, "${locatorLabel(@locator)}: expected text `${expected}`, got `${actual}`")
-      end
-      Task.sleep(Duration.milliseconds(50))
-    end
+    eventually(@locator, "text `${expected}`", { |each| each.text() }, { |seen| seen == expected })
+  end
+
+  foul toContainText(expected: String) -> Void do
+    eventually(@locator, "text containing `${expected}`", { |each| each.text() },
+      { |seen| seen.contains?(expected) })
   end
 
   foul toHaveValue(expected: String) -> Void do
-    let deadline = DateTime.epochNanos() / 1000000 + @locator.page.options.timeoutMs
-    var actual = "<unavailable>"
-    loop do
-      match found(@locator) do
-        Error(_) => ()
-        Ok(matches) when matches.count > 1 => do
-          evidence(@locator.page, "failure")
-          assert(false, "${locatorLabel(@locator)} matched ${matches.count} elements")
-          ()
-        end
-        Ok(matches) when matches.count == 1 => do
-          match @locator.value() do
-            Ok(value) => do
-              actual = value
-              if actual == expected
-                return ()
-              end
-            end
-            Error(reason) => do
-              evidence(@locator.page, "failure")
-              assert(false, reason)
-              ()
-            end
-          end
-        end
-        _ => ()
-      end
-      if DateTime.epochNanos() / 1000000 >= deadline
-        evidence(@locator.page, "failure")
-        assert(false, "${locatorLabel(@locator)}: expected value `${expected}`, got `${actual}`")
-      end
-      Task.sleep(Duration.milliseconds(50))
-    end
+    eventually(@locator, "value `${expected}`", { |each| each.value() }, { |seen| seen == expected })
+  end
+
+  foul toHaveCount(expected: Integer) -> Void do
+    eventually(@locator, "${expected} matches", { |each| Ok("${each.count().try}") },
+      { |seen| seen == "${expected}" })
   end
 
   foul toBeVisible() -> Void do
     match waitFor(@locator, "toBeVisible", false) do
       Ok(_) => ()
-      Error(reason) => do
-        evidence(@locator.page, "failure")
-        assert(false, reason)
-        ()
-      end
+      Error(reason) => fail(@locator.page, reason)
     end
+  end
+
+  # Absent, or present and not displayed.
+  foul toBeHidden() -> Void do
+    let visibility = { |each|
+      let matches = found(each).try
+      let shown = matches.filter { |entry| field(entry, "visible") == true }.count
+      Ok(shown == 0 then "hidden" else "${shown} visible")
+    }
+    eventually(@locator, "no visible match", visibility, { |seen| seen == "hidden" })
   end
 end
 
@@ -551,12 +339,11 @@ foul withPage(options: Options, work: Page -> Any) -> Void do
   rescue |problem|
     Error("${problem}")
   end
-  let failure = match result do
-    Error(reason) => Just("${reason}")
-    _ => None
-  end
-  match failure do
-    Just(reason) => do
+  match result do
+    Error(problem) => do
+      # A failed expectation arrives already worded as an assertion.
+      let prefix = "assertion failed: "
+      let reason = "${problem}".startsWith?(prefix) then "${problem}".drop(prefix.length) else "${problem}"
       failureEvidence(page)
       if options.watch?
         IO.printError("Shakespeare stopped: ${reason}")
@@ -564,9 +351,376 @@ foul withPage(options: Options, work: Page -> Any) -> Void do
         IO.getLine
       end
       browser.close
-      assert(false, reason)
+      assert(false, "${reason}")
       ()
     end
-    None => browser.close
+    _ => browser.close
+  end
+end
+
+# Internals: the protocol plumbing and in-page scripts the API is built on.
+private do
+  # Parsed CDP responses contain ordinary Kex maps. Keep dynamic access in one
+  # place, and check missing fields before showing them to callers.
+  let field(value: Any, name: String) -> Any do
+    match Kex.Intrinsic.Map.get(value, name) do
+      Just(found) => found
+      None => None
+    end
+  end
+
+  let string(value: Any, name: String) -> String do
+    let found = field(value, name)
+    found == None then "" else "${found}"
+  end
+
+  foul epochMs() -> Integer = DateTime.epochNanos() / 1000000
+
+  foul pause(milliseconds: Integer) -> Void = Task.sleep(Duration.milliseconds(milliseconds))
+
+  foul cdpRequest(transport: Server<State>, session: String, method: String,
+                  params: Any, timeoutMs: Integer) -> Any or! String do
+    match transport.exchange(session, method, params, timeoutMs, within: timeoutMs + 2000) do
+      Ok(value) => value
+      Error(error) => Error("CDP ${method}: ${error}")
+    end
+  end
+
+  foul command(page: Page, method: String, params: Any) -> Any or! String do
+    cdpRequest(page.transport, page.sessionId, method, params, page.options.timeoutMs)
+  end
+
+  foul executable(options: Options) -> String do
+    let candidates = [
+      options.browserPath,
+      ENV.get("CHROME_PATH").or(""),
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser"
+    ]
+    candidates.find { |candidate| !candidate.empty? && FS.File.file?(candidate) }.or("")
+  end
+
+  # Chrome runs under a small shell that outlives nothing it started. The Kex
+  # runtime terminates the shell when the spawning process dies or the VM gets
+  # SIGTERM; the shell then stops Chrome and removes the profile. A VM that
+  # halts, is interrupted, or is killed outright cannot do that, so a watcher
+  # notices the shell being orphaned and does the same.
+  let supervisor = [
+    "chrome=\"$0\"; profile=\"$1\"; shift",
+    "\"$chrome\" \"$@\" >\"$profile/browser.log\" 2>&1 &",
+    "browser=$!; shell=$$",
+    "orphaned() { [ \"$(ps -o ppid= -p \"$shell\" | tr -d ' ')\" = 1 ]; }",
+    "(while kill -0 \"$browser\" 2>/dev/null; do",
+    "  if orphaned; then kill \"$browser\"; exit; fi",
+    "  sleep 1",
+    "done) &",
+    "watcher=$!",
+    "trap 'kill \"$browser\" 2>/dev/null; wait \"$browser\"; kill \"$watcher\" 2>/dev/null; rm -rf \"$profile\"; exit 143' TERM HUP INT",
+    "wait \"$browser\"",
+    "kill \"$watcher\" 2>/dev/null",
+    "if orphaned; then rm -rf \"$profile\"; fi"
+
+  ].join("\n")
+
+  # Last resort when the browser ignores Browser.close: the profile path is
+  # unique to this browser, so it names exactly the processes to stop.
+  foul stopChrome(profile: String) -> Void do
+    Process.run("pkill", ["-f", profile])
+    ()
+  end
+
+  foul abandon(profile: String, transport: Server<State>?) -> Void do
+    match transport do
+      Just(open) => open.close
+      None => ()
+    end
+    stopChrome(profile)
+    FS.Directory.deleteAll(profile)
+    ()
+  end
+
+  foul artifactDirectory(options: Options) -> String or! String do
+    let directory = options.watch? && options.artifacts.empty? then
+      FS.Directory.createTemporary("shakespeare-watch").or("")
+    else
+      options.artifacts
+    return Ok("") if directory.empty?
+    if !FS.Directory.exists?(directory) && !FS.Directory.create(directory)
+      return Error("could not create artifact directory ${directory}")
+    end
+    if options.watch?
+      IO.printError("Shakespeare watch artifacts: ${directory}")
+    end
+    Ok(directory)
+  end
+
+  foul openPage(transport: Server<State>, options: Options, artifacts: String) -> Page or! String do
+    let context = cdpRequest(transport, "", "Target.createBrowserContext", {}, options.timeoutMs).try
+    let contextId = string(context, "browserContextId")
+    let made = cdpRequest(transport, "", "Target.createTarget",
+      { url: "about:blank", browserContextId: contextId }, options.timeoutMs).try
+    let targetId = string(made, "targetId")
+    let attached = cdpRequest(transport, "", "Target.attachToTarget",
+      { targetId: targetId, flatten: true }, options.timeoutMs).try
+    let page = Page {
+      transport: transport,
+      contextId: contextId,
+      sessionId: string(attached, "sessionId"),
+      targetId: targetId,
+      options: options,
+      artifacts: artifacts
+    }
+    command(page, "Page.enable", {}).try
+    command(page, "Runtime.enable", {}).try
+    if options.watch?
+      command(page, "Overlay.enable", {}).try
+    end
+    Ok(page)
+  end
+
+  # Wait for the document to be replaced and loaded. A new navigation has a
+  # new `performance.timeOrigin`, even when the address stays the same.
+  foul awaitLoad(page: Page, before: Any, url: String) -> Void or! String do
+    let deadline = epochMs() + page.options.timeoutMs
+    loop do
+      let state = page.evaluate("({url: location.href, origin: performance.timeOrigin, ready: document.readyState === 'complete'})").or({})
+      let moved = field(state, "url") != field(before, "url")
+      let reloaded = field(state, "origin") != field(before, "origin")
+      if field(state, "ready") == true && (moved || reloaded)
+        note(page, "loaded ${url}")
+        evidence(page, "load")
+        if page.options.watch?
+          pause(page.options.slowMs)
+        end
+        return Ok(())
+      end
+      return Error("navigation to ${url} timed out") if epochMs() >= deadline
+      pause(50)
+    end
+  end
+
+  let documentState = "({url: location.href, origin: performance.timeOrigin})"
+
+  # In-page scripts are small and deterministic; selector text is JSON quoted.
+  # Text is compared as a reader sees it: runs of whitespace are one space.
+  let lookup(locator: Locator) -> String do
+    let candidates = locatorCandidates(locator)
+    "(() => { const nodes = ${candidates}; return nodes.map(e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return {text: e.textContent.replace(/\\s+/g, ' ').trim(), visible: r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none', enabled: !e.disabled && e.getAttribute('aria-disabled') !== 'true', x: r.x + r.width / 2, y: r.y + r.height / 2, width: r.width, height: r.height}; }); })()"
+  end
+
+  # Narrowed by `withText`: candidates whose text contains it.
+  let locatorCandidates(locator: Locator) -> String do
+    let all = matching(locator)
+    return all if locator.hasText.empty?
+    let text = JSON.stringify(locator.hasText)
+    "${all}.filter(e => e.textContent.replace(/\\s+/g, ' ').includes(${text}))"
+  end
+
+  let matching(locator: Locator) -> String do
+    let query = JSON.stringify(locator.query)
+    if locator.kind == "css"
+      return "Array.from(document.querySelectorAll(${query}))"
+    end
+    if locator.kind == "text"
+      return "Array.from(document.querySelectorAll('body *')).filter(e => e.children.length === 0 && e.textContent.replace(/\\s+/g, ' ').trim() === ${query})"
+    end
+    let name = JSON.stringify(locator.name)
+    "Array.from(document.querySelectorAll('body *')).filter(e => { const type = (e.getAttribute('type') || 'text').toLowerCase(); const implicit = e.tagName === 'BUTTON' ? 'button' : e.tagName === 'A' && e.hasAttribute('href') ? 'link' : e.tagName === 'TEXTAREA' ? 'textbox' : e.tagName === 'SELECT' ? 'combobox' : /^H[1-6]$/.test(e.tagName) ? 'heading' : e.tagName === 'IMG' ? 'img' : e.tagName === 'INPUT' ? ({text:'textbox',email:'textbox',search:'searchbox',tel:'textbox',url:'textbox',password:'textbox',checkbox:'checkbox',radio:'radio',number:'spinbutton',button:'button',submit:'button',reset:'button'}[type] || '') : ''; const role = e.getAttribute('role') || implicit; const refs = e.getAttribute('aria-labelledby'); const labelledBy = refs ? refs.trim().split(' ').map(id => document.getElementById(id)).filter(Boolean).map(node => (node.innerText || node.textContent || '').trim()).join(' ') : ''; const labels = e.labels ? Array.from(e.labels).map(label => (label.innerText || label.textContent || '').trim()).join(' ') : ''; const accessibleName = labelledBy || e.getAttribute('aria-label') || labels || e.getAttribute('alt') || (e.innerText || '').trim() || e.getAttribute('value') || e.getAttribute('title') || e.getAttribute('placeholder') || ''; return role === ${query} && accessibleName.replace(/\\s+/g, ' ') === ${name}; })"
+  end
+
+  let element(locator: Locator) -> String = "${locatorCandidates(locator)}[0]"
+
+  let locatorLabel(locator: Locator) -> String do
+    let base = locator.kind == "role" then
+      "role `${locator.query}` named `${locator.name}`"
+    else
+      "${locator.kind} `${locator.query}`"
+    locator.hasText.empty? then base else "${base} with text `${locator.hasText}`"
+  end
+
+  foul found(locator: Locator) -> [Any] or! String do
+    let entries: [Any] = locator.page.evaluate(lookup(locator)).try
+    Ok(entries)
+  end
+
+  # Wait until the locator matches one visible element, enabled when an action
+  # needs it to be. Several matches are a mistake in the test, not a wait.
+  foul waitFor(locator: Locator, action: String, requireEnabled: Bool) -> Any or! String do
+    let deadline = epochMs() + locator.page.options.timeoutMs
+    var last = "no match"
+    loop do
+      let matches = found(locator).try
+      if matches.count == 1
+        let target = matches.first.or({})
+        if field(target, "visible") == true && (!requireEnabled || field(target, "enabled") == true)
+          return Ok(target)
+        end
+        last = "the matching element is hidden or disabled"
+      elif matches.count > 1
+        return Error("${action}: ${locatorLabel(locator)} matched ${matches.count} elements")
+      end
+      if epochMs() >= deadline
+        return Error("${action}: ${locatorLabel(locator)} timed out (${last})")
+      end
+      pause(50)
+    end
+  end
+
+  # Bring the target into view and answer where it is then, ready for input.
+  foul actionable(locator: Locator, action: String) -> Any or! String do
+    waitFor(locator, action, true).try
+    let selector = element(locator)
+    let scrolled = locator.page.evaluate(
+      "(() => { const e = ${selector}; if (!e) return false; e.scrollIntoView({ block: 'center', inline: 'center' }); return true; })()"
+    ).try
+    return Error("${action}: ${locatorLabel(locator)} disappeared") if scrolled != true
+    let target = waitFor(locator, action, true).try
+    note(locator.page, "${action} ${locatorLabel(locator)}")
+    highlight(locator.page, target)
+    Ok(target)
+  end
+
+  foul mouse(page: Page, kind: String, target: Any) -> Void or! String do
+    let at = { "type": kind, x: field(target, "x"), y: field(target, "y") }
+    let event = kind == "mouseMoved" then at else at.put(:button, "left").put(:clickCount, 1)
+    command(page, "Input.dispatchMouseEvent", event).try
+    Ok(())
+  end
+
+  # Focus the element unless it has focus already. Newly focused text goes on
+  # at its end, as after a click past the last word; focus it already had
+  # keeps its caret where the page put it.
+  foul focus(locator: Locator, action: String) -> Void or! String do
+    let selector = element(locator)
+    let focused = locator.page.evaluate(
+      "(() => { const e = ${selector}; if (!e) return false; if (document.activeElement !== e) { e.focus(); if (typeof e.value === 'string') { try { e.setSelectionRange(e.value.length, e.value.length) } catch (_) {} } } return document.activeElement === e; })()"
+    ).try
+    return Error("${action}: ${locatorLabel(locator)} cannot take focus") if focused != true
+    Ok(())
+  end
+
+  # Key names as KeyboardEvent.key spells them, with their legacy key codes.
+  # A key that types something carries its text, so Enter submits a form.
+  let keys = {
+    "Enter": (13, "\r"),
+    "Tab": (9, ""),
+    "Escape": (27, ""),
+    "Backspace": (8, ""),
+    "Delete": (46, ""),
+    "ArrowUp": (38, ""),
+    "ArrowDown": (40, ""),
+    "ArrowLeft": (37, ""),
+    "ArrowRight": (39, ""),
+    "Home": (36, ""),
+    "End": (35, "")
+
+  }
+
+  let modifierBits = { "Alt": 1, "Control": 2, "Meta": 4, "Shift": 8 }
+
+  foul pressKey(page: Page, chord: String) -> Void or! String do
+    let parts = chord.split("+")
+    let key = parts.last.or(chord)
+    let (code, text) = match keys[key] do
+      Just(known) => known
+      None => return Error("press: unknown key `${key}`")
+    end
+    let held = parts.take(parts.count - 1)
+    let unknown = held.find { |modifier| modifierBits[modifier] == None }
+    return Error("press: unknown modifier `${unknown.or("")}`") if unknown != None
+    let modifiers = held.map { |modifier| modifierBits[modifier].or(0) }.sum
+    let typed = modifiers == 0 || modifiers == 8 then text else ""
+    let down = {
+      "type": typed.empty? then "rawKeyDown" else "keyDown",
+      key: key,
+      code: key,
+      windowsVirtualKeyCode: code,
+      modifiers: modifiers
+    }
+    command(page, "Input.dispatchKeyEvent", typed.empty? then down else down.put(:text, typed)).try
+    command(page, "Input.dispatchKeyEvent", down.put("type", "keyUp")).try
+    Ok(())
+  end
+
+  foul note(page: Page, description: String) -> Void do
+    return () if !page.options.watch?
+    IO.printError("Shakespeare: ${description}")
+    if !page.artifacts.empty?
+      FS.File.append(FS.Path.join(page.artifacts, "actions.log"), "${epochMs()} ${description}\n")
+    end
+  end
+
+  foul evidence(page: Page, label: String) -> Void do
+    if page.options.watch? && !page.artifacts.empty?
+      page.screenshot(FS.Path.join(page.artifacts, "${DateTime.epochNanos()}-${label}.png"))
+    end
+  end
+
+  foul failureEvidence(page: Page) -> Void do
+    let directory = page.artifacts.empty? then
+      FS.Directory.createTemporary("shakespeare-failure").or("")
+    else
+      page.artifacts
+    return () if directory.empty?
+    page.screenshot(FS.Path.join(directory, "failure.png"))
+    match page.evaluate("document.documentElement.outerHTML") do
+      Ok(html) => do FS.File.write(FS.Path.join(directory, "page.html"), "${html}") () end
+      Error(_) => ()
+    end
+    match page.url() do
+      Ok(address) => do FS.File.write(FS.Path.join(directory, "url.txt"), "${address}\n") () end
+      Error(_) => ()
+    end
+    IO.printError("Shakespeare failure evidence: ${directory}")
+  end
+
+  foul highlight(page: Page, target: Any) -> Void do
+    return () if !page.options.watch?
+    command(page, "Overlay.highlightRect", {
+      x: field(target, "x") - field(target, "width") / 2,
+      y: field(target, "y") - field(target, "height") / 2,
+      width: field(target, "width"),
+      height: field(target, "height"),
+      color: { r: 50, g: 150, b: 255, a: 0.25 }
+    })
+    pause(page.options.slowMs)
+  end
+
+  foul unhighlight(page: Page) -> Void do
+    if page.options.watch?
+      command(page, "Overlay.hideHighlight", {})
+    end
+  end
+
+  foul fail(page: Page, reason: String) -> Void do
+    evidence(page, "failure")
+    assert(false, reason)
+    ()
+  end
+
+  # Retry until `observe` sees something `accept` takes, or the timeout ends.
+  # The page may still be changing — a Live patch, a navigation — so neither a
+  # missing element nor several matching ones is final until then.
+  foul eventually(locator: Locator, wanted: String, observe: Locator -> String or! String,
+                  accept: String -> Bool) -> Void do
+    let deadline = epochMs() + locator.page.options.timeoutMs
+    var actual = "<missing>"
+    loop do
+      match observe(locator) do
+        Ok(seen) => do
+          return () if accept(seen)
+          actual = "`${seen}`"
+        end
+        Error(reason) => actual = "<${reason}>"
+      end
+      if epochMs() >= deadline
+        fail(locator.page, "${locatorLabel(locator)}: expected ${wanted}, got ${actual}")
+        return ()
+      end
+      pause(50)
+    end
   end
 end
