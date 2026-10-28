@@ -8,6 +8,9 @@ using Net.HTTP.WebSocket, only: [WebSocket]
 record Options do
   browserPath : String = ""
   watch? : Bool = false
+  # A watched run without a window: paced, highlighted and recorded, for a
+  # machine with no display.
+  headless? : Bool = false
   slowMs : Integer = 350
   timeoutMs : Integer = 10000
   artifacts : String = ""
@@ -58,7 +61,8 @@ foul launch(options: Options) -> Browser or! String do
     "--autoplay-policy=no-user-gesture-required",
     "about:blank"
   ]
-  let flags = options.watch? then arguments else ["--headless=new", ...arguments]
+  let visible = options.watch? && !options.headless?
+  let flags = visible then arguments else ["--headless=new", ...arguments]
   let runner: Process<Any> = spawn do
     Process.stream("sh", ["-c", supervisor, path, profile, ...flags])
   end
@@ -187,7 +191,7 @@ make Locator do
   foul hover() -> Void or! String do
     let target = actionable(this, "hover").try
     mouse(@page, "mouseMoved", target).try
-    unhighlight(@page)
+    unhighlight(@page).try
     evidence(@page, "hover")
     Ok(())
   end
@@ -199,7 +203,7 @@ make Locator do
     let settled = waitFor(this, "click", true).try
     mouse(@page, "mousePressed", settled).try
     mouse(@page, "mouseReleased", settled).try
-    unhighlight(@page)
+    unhighlight(@page).try
     evidence(@page, "click")
     Ok(())
   end
@@ -217,7 +221,7 @@ make Locator do
     else
       command(@page, "Input.insertText", { text: text }).try
     end
-    unhighlight(@page)
+    unhighlight(@page).try
     evidence(@page, "fill")
     Ok(())
   end
@@ -228,7 +232,7 @@ make Locator do
     actionable(this, "write").try
     focus(this, "write").try
     command(@page, "Input.insertText", { text: text }).try
-    unhighlight(@page)
+    unhighlight(@page).try
     evidence(@page, "write")
     Ok(())
   end
@@ -242,7 +246,7 @@ make Locator do
       "(() => { const e = ${selector}; if (!e || e.tagName !== 'SELECT') return 'not a select'; const o = Array.from(e.options).find(o => o.value === ${wanted} || o.label.trim() === ${wanted}); if (!o) return 'no option'; e.value = o.value; e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); return 'chosen'; })()"
     ).try
     return Error("select: ${locatorLabel(this)}: ${chosen} `${choice}`") if chosen != "chosen"
-    unhighlight(@page)
+    unhighlight(@page).try
     evidence(@page, "select")
     Ok(())
   end
@@ -252,7 +256,7 @@ make Locator do
     actionable(this, "press").try
     focus(this, "press").try
     pressKey(@page, key).try
-    unhighlight(@page)
+    unhighlight(@page).try
     evidence(@page, "press")
     Ok(())
   end
@@ -345,7 +349,7 @@ foul withPage(options: Options, work: Page -> Any) -> Void do
       let prefix = "assertion failed: "
       let reason = "${problem}".startsWith?(prefix) then "${problem}".drop(prefix.length) else "${problem}"
       failureEvidence(page)
-      if options.watch?
+      if options.watch? && !options.headless?
         IO.printError("Shakespeare stopped: ${reason}")
         IO.printError("Browser is open for inspection. Press Enter to close it.")
         IO.getLine
@@ -476,6 +480,8 @@ private do
     command(page, "Page.enable", {}).try
     command(page, "Runtime.enable", {}).try
     if options.watch?
+      # The overlay draws over DOM nodes, so Chrome wants DOM enabled first.
+      command(page, "DOM.enable", {}).try
       command(page, "Overlay.enable", {}).try
     end
     Ok(page)
@@ -508,7 +514,7 @@ private do
   # Text is compared as a reader sees it: runs of whitespace are one space.
   let lookup(locator: Locator) -> String do
     let candidates = locatorCandidates(locator)
-    "(() => { const nodes = ${candidates}; return nodes.map(e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return {text: e.textContent.replace(/\\s+/g, ' ').trim(), visible: r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none', enabled: !e.disabled && e.getAttribute('aria-disabled') !== 'true', x: r.x + r.width / 2, y: r.y + r.height / 2, width: r.width, height: r.height}; }); })()"
+    "(() => { const nodes = ${candidates}; return nodes.map(e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return {text: e.textContent.replace(/\\s+/g, ' ').trim(), visible: r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none', enabled: !e.disabled && e.getAttribute('aria-disabled') !== 'true', x: r.x + r.width / 2, y: r.y + r.height / 2, width: r.width, height: r.height, box: {x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}}; }); })()"
   end
 
   # Narrowed by `withText`: candidates whose text contains it.
@@ -579,7 +585,7 @@ private do
     return Error("${action}: ${locatorLabel(locator)} disappeared") if scrolled != true
     let target = waitFor(locator, action, true).try
     note(locator.page, "${action} ${locatorLabel(locator)}")
-    highlight(locator.page, target)
+    highlight(locator.page, target).try
     Ok(target)
   end
 
@@ -677,22 +683,25 @@ private do
     IO.printError("Shakespeare failure evidence: ${directory}")
   end
 
-  foul highlight(page: Page, target: Any) -> Void do
-    return () if !page.options.watch?
+  foul highlight(page: Page, target: Any) -> Void or! String do
+    return Ok(()) if !page.options.watch?
+    # The overlay takes whole pixels: the lookup rounds the element's box.
+    let box = field(target, "box")
     command(page, "Overlay.highlightRect", {
-      x: field(target, "x") - field(target, "width") / 2,
-      y: field(target, "y") - field(target, "height") / 2,
-      width: field(target, "width"),
-      height: field(target, "height"),
+      x: field(box, "x"),
+      y: field(box, "y"),
+      width: field(box, "width"),
+      height: field(box, "height"),
       color: { r: 50, g: 150, b: 255, a: 0.25 }
-    })
+    }).try
     pause(page.options.slowMs)
+    Ok(())
   end
 
-  foul unhighlight(page: Page) -> Void do
-    if page.options.watch?
-      command(page, "Overlay.hideHighlight", {})
-    end
+  foul unhighlight(page: Page) -> Void or! String do
+    return Ok(()) if !page.options.watch?
+    command(page, "Overlay.hideHighlight", {}).try
+    Ok(())
   end
 
   foul fail(page: Page, reason: String) -> Void do

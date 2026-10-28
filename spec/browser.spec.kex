@@ -15,6 +15,7 @@ end
 
 foul options(timeoutMs: Integer) -> Shakespeare.Options = Shakespeare.Options {
   watch?: ENV.get("SHAKESPEARE_WATCH") == Just("1"),
+  headless?: ENV.get("SHAKESPEARE_HEADLESS") == Just("1"),
   slowMs: 100,
   timeoutMs: timeoutMs
 }
@@ -155,5 +156,43 @@ describe("Shakespeare browser") do
         other.close
       end
     end
+  end
+
+  # Watch mode on every run, without a window: each action highlighted and
+  # recorded, and all of it must work, not only the headless path.
+  it("watches a run, highlighting and recording each action") do
+    let artifacts = FS.Directory.createTemporary("shakespeare-spec-watch").or("")
+    Assert.falsy(artifacts.empty?)
+    let watching = Shakespeare.Options {
+      watch?: true,
+      headless?: true,
+      slowMs: 10,
+      timeoutMs: 3000,
+      artifacts: artifacts
+    }
+    hosting(interactive) do |base|
+      Shakespeare.withPage(watching) do |page|
+        page.goto(base).try
+        page.locator("#reveal").hover().try
+        page.getByRole("textbox", "Name").fill("Ada").try
+        page.getByRole("textbox", "Name").press("Enter").try
+        page.getByRole("button", "Go").click().try
+        Shakespeare.expect(page.locator("#out")).toHaveText("Ada")
+        let second = page.newPage().try
+        second.goto(base).try
+        second.locator("#name").write("Bob").try
+        second.close
+      end
+    end
+    let log = FS.File.read(FS.Path.join(artifacts, "actions.log")).or("")
+    Assert.truthy(log.contains?("goto http:"))
+    Assert.truthy(log.contains?("hover css `#reveal`"))
+    Assert.truthy(log.contains?("fill role `textbox` named `Name`"))
+    Assert.truthy(log.contains?("press role `textbox` named `Name`"))
+    Assert.truthy(log.contains?("click role `button` named `Go`"))
+    Assert.truthy(log.contains?("write css `#name`"))
+    let shots = FS.Directory.list(artifacts).or([]).filter { |name| name.endsWith?(".png") }
+    Assert.truthy(shots.count >= 6)
+    FS.Directory.deleteAll(artifacts)
   end
 end
