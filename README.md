@@ -12,7 +12,15 @@ Shakespeare is licensed under LGPL-3.0-or-later. The license texts are in
 
 ## A browser spec
 
-Add Shakespeare as a local Tey dependency while developing:
+Add a Shakespeare release as a Tey dependency:
+
+```kex
+group :browser do
+  tey("shakespeare", git: "https://github.com/kexhq/shakespeare", tag: "v0.1.0")
+end
+```
+
+Or, while changing Shakespeare itself, the adjacent checkout:
 
 ```kex
 group :browser do
@@ -86,6 +94,8 @@ chosen directory.
 
 If the case fails, `withPage` captures a final screenshot and leaves the
 browser open until Enter is pressed. Headless runs close without pausing.
+Add `headless?: true` to watch without a window, on a machine with no
+display: actions are still paced, highlighted and recorded.
 Choose the mode from the environment to keep one spec for both:
 
 ```kex
