@@ -59,10 +59,14 @@ foul launch(options: Options) -> Browser or! String do
     "--no-first-run", "--no-default-browser-check",
     "--disable-background-networking",
     "--autoplay-policy=no-user-gesture-required",
+    # A container's /dev/shm is too small for Chrome's shared memory.
+    "--disable-dev-shm-usage",
     "about:blank"
   ]
+  # Chrome refuses to run as root with its sandbox, which a CI container is.
+  let sandboxed = superuser?() then ["--no-sandbox", ...arguments] else arguments
   let visible = options.watch? && !options.headless?
-  let flags = visible then arguments else ["--headless=new", ...arguments]
+  let flags = visible then sandboxed else ["--headless=new", ...sandboxed]
   let runner: Process<Any> = spawn do
     Process.stream("sh", ["-c", supervisor, path, profile, ...flags])
   end
@@ -430,6 +434,10 @@ private do
     "if orphaned; then rm -rf \"$profile\"; fi"
 
   ].join("\n")
+
+  foul superuser?() -> Bool do
+    Process.run("id", ["-u"]).map { |result| result.stdout.trim == "0" }.or(false)
+  end
 
   # Last resort when the browser ignores Browser.close: the profile path is
   # unique to this browser, so it names exactly the processes to stop.

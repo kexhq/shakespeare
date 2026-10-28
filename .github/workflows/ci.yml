@@ -1,0 +1,91 @@
+# Whether Shakespeare's specs pass, driving a real Chromium.
+#
+#   test   in the Kex toolchain image, with Debian's Chromium: tey install,
+#          tey test. The specs run headless, and once more in watch mode
+#          without a window, so both paths are held to. When a spec fails,
+#          the evidence Shakespeare saved (screenshot, page HTML, address)
+#          is attached to the run.
+#
+# Set on the repository (Settings → Secrets and variables → Actions):
+#
+#   KEX_IMAGE   variable, optional: the Kex toolchain image, when it is not
+#               ghcr.io/kexhq/kex:rc
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Specs in Chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ${{ vars.KEX_IMAGE || 'ghcr.io/kexhq/kex:rc' }}
+    env:
+      # Kex 0.4.0-rc.3, which package.kex asks for, is not in a toolchain
+      # image yet. Build the compiler from Kex main and make Tey use it.
+      TEY_KEX: ${{ github.workspace }}/.kex-source/build/kex
+      KEX: ${{ github.workspace }}/.kex-source/build/kex
+      KEX_STDLIB_DIR: ${{ github.workspace }}/.kex-source/src/stdlib
+      KEX_RUNTIME_DIR: ${{ github.workspace }}/.kex-source/build/runtime/beam
+      CHROME_PATH: /usr/bin/chromium
+    steps:
+      # procps: Shakespeare's supervisor watches its parent with `ps`, and
+      # stops a stuck browser with `pkill`.
+      - name: Install git, Chromium and procps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates chromium fonts-liberation procps
+
+      - uses: actions/checkout@v4
+
+      - name: Check out Kex
+        uses: actions/checkout@v4
+        with:
+          repository: kexhq/kex
+          ref: c7aaedf253ff71e736e3c556ddf8ea50cc974769
+          path: .kex-source
+
+      - name: Install Kex build dependencies
+        run: |
+          apt-get install -y --no-install-recommends build-essential cmake libgmp-dev libpcre2-dev libreadline-dev libboost-context-dev libssl-dev erlang-dev
+
+      - name: Build Kex compiler
+        run: |
+          cmake -S .kex-source -B .kex-source/build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build .kex-source/build --parallel 2
+
+      - name: Install dependencies
+        run: tey install
+
+      - name: Specs
+        run: tey test
+
+      # The same specs, every action highlighted, paced and recorded: a
+      # watched run must work as well as a plain one.
+      - name: Specs, watched without a window
+        env:
+          SHAKESPEARE_WATCH: "1"
+          SHAKESPEARE_HEADLESS: "1"
+        run: tey test < /dev/null
+
+      - name: Keep the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shakespeare-evidence
+          path: |
+            /tmp/shakespeare-failure-*
+            /tmp/shakespeare-watch-*
+          if-no-files-found: ignore
