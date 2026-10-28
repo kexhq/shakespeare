@@ -1,16 +1,29 @@
 using Net.HTTP, only: [Headers]
 
 # Serve one page of HTML at `/` for the length of a case.
+#
+# No `.try` in this body: a function using it catches a failed assertion
+# raised by the block it runs, and the case then passes.
 foul hosting(html: String, work: String -> Any) -> Void do
   let router = Net.HTTP.Router.build.get("/", do |_, _|
     Net.HTTP.Response.binary(200, html.to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
   end)
-  let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
-  let server = Net.HTTP.Server.start(endpoint, router).try
-  let port = Net.HTTP.Server.localAddress(server).port.value
-  work("http://127.0.0.1:${port}/")
-  Net.HTTP.Server.stop(server).try
-  ()
+  let started = match Net.Port.from(0) do
+    Ok(any) => Net.HTTP.Server.start(Net.Socket.TCP.Endpoint.loopback(any), router)
+    Error(reason) => Error("${reason}")
+  end
+  match started do
+    Ok(server) => do
+      let port = Net.HTTP.Server.localAddress(server).port.value
+      work("http://127.0.0.1:${port}/")
+      Net.HTTP.Server.stop(server)
+      ()
+    end
+    Error(reason) => do
+      assert(false, "the test page could not be served: ${reason}")
+      ()
+    end
+  end
 end
 
 foul options(timeoutMs: Integer) -> Shakespeare.Options = Shakespeare.Options {
@@ -142,6 +155,24 @@ describe("Shakespeare browser") do
         Assert.equal(page.locator("#people button").withText("Ada").text(), Ok("Ada"))
       end
     end
+  end
+
+  # A failure must reach the runner as a failure, through `hosting` too:
+  # a helper that swallowed it would turn every case here green.
+  it("reports a failed action instead of passing") do
+    let outcome = trying do
+      hosting(interactive) do |base|
+        Shakespeare.withPage(options(500)) do |page|
+          page.goto(base).try
+          page.locator("#missing").click().try
+        end
+      end
+      Ok(())
+    rescue |problem|
+      Error("${problem}")
+    end
+    Assert.truthy(outcome.error?)
+    Assert.truthy("${outcome}".contains?("click: css `#missing` timed out"))
   end
 
   it("keeps each page's cookies to itself") do

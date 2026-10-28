@@ -67,7 +67,9 @@ foul launch(options: Options) -> Browser or! String do
     Process.stream("sh", ["-c", supervisor, path, profile, ...flags])
   end
   let portFile = FS.Path.join(profile, "DevToolsActivePort")
-  let deadline = epochMs() + options.timeoutMs
+  # Starting Chrome is not an action: a short action timeout must not cut it off.
+  let startup = options.timeoutMs > 30000 then options.timeoutMs else 30000
+  let deadline = epochMs() + startup
   while !FS.File.file?(portFile) && epochMs() < deadline do
     pause(50)
   end
