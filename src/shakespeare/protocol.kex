@@ -26,7 +26,7 @@ serving State do
       if remaining <= 0
         return { new, reply: Error("CDP ${method} timed out after ${timeoutMs} ms") }
       end
-      match @socket.receiveMessage(timeout: Just(Duration.milliseconds(remaining))) do
+      match @socket.receiveMessage(timeout: Just(remaining.millisecond)) do
         Error(error) => return { new, reply: Error("CDP receive ${method}: ${error}") }
         Ok(CloseMessage(_, reason)) => return { new, reply: Error("browser closed: ${reason}") }
         Ok(Text(body)) => do

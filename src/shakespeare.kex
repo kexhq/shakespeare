@@ -386,7 +386,7 @@ private do
 
   foul epochMs() -> Integer = DateTime.epochNanos() / 1000000
 
-  foul pause(milliseconds: Integer) -> Void = Task.sleep(Duration.milliseconds(milliseconds))
+  foul pause(milliseconds: Integer) -> Void = Task.sleep(milliseconds.millisecond)
 
   foul cdpRequest(transport: Server<State>, session: String, method: String,
                   params: Any, timeoutMs: Integer) -> Any or! String do
@@ -462,7 +462,7 @@ private do
     else
       options.artifacts
     return Ok("") if directory.empty?
-    if !FS.Directory.exists?(directory) && !FS.Directory.create(directory)
+    if !FS.Directory.exists?(directory) && FS.Directory.create(directory).error?
       return Error("could not create artifact directory ${directory}")
     end
     if options.watch?
