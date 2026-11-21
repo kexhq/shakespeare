@@ -8,8 +8,12 @@ foul hosting(html: String, work: String -> Any) -> Void do
   let router = Net.HTTP.Router.build.get("/", do |_, _|
     Net.HTTP.Response.binary(200, html.to(Binary).try, Headers.empty.add("Content-Type", "text/html").try)
   end)
+  # Both failures as text: the port's, and the server's `NetError`.
   let started = match Net.Port.from(0) do
-    Ok(any) => Net.HTTP.Server.start(Net.Socket.TCP.Endpoint.loopback(any), router)
+    Ok(any) => match Net.HTTP.Server.start(Net.Socket.TCP.Endpoint.loopback(any), router) do
+      Ok(server) => Ok(server)
+      Error(reason) => Error("${reason}")
+    end
     Error(reason) => Error("${reason}")
   end
   match started do
