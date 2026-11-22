@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "workspace": {"members": {"shakespeare": "."}, "manifest_fingerprint": "9781ef16427a1df2c7a9a8fdd9f446a70d7dec382a0152abf6ca0af666056927"},
+  "toolchain": {"kex": "0.4.0", "kex_requirement": ">= 0.4.0-rc.3", "otp": 29, "otp_requirement": ""},
+  "packages": {
+    "shakespeare": {"version": "0.1.0", "source": "workspace", "git": "", "resolved": "", "commit": "", "subdir": "", "path": ".", "sha256": "", "groups": [], "dependencies": [], "plugins": {}, "workspace": true}
+  },
+  "plugins": {"approvals": {}}
+}

@@ -12,7 +12,7 @@ describe("Rodolfo in a browser") do
       end
     end
     let server = site.background(0).try
-    let port = server.localAddress.port.value
+    let port = Net.HTTP.Server.localAddress(server).port.value
     Shakespeare.withPage(Shakespeare.Options {}) do |page|
       page.goto("http://127.0.0.1:${port}/").try
       page.locator("#name").fill("Ada").try

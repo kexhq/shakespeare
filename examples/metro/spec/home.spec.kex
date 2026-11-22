@@ -33,7 +33,7 @@ describe("Metro Live in a browser") do
     end
     let endpoint = Net.Socket.TCP.Endpoint.loopback(Net.Port.from(0).try)
     let server = Server.start(endpoint, routes.httpRouter).try
-    let port = server.localAddress.port.value
+    let port = Net.HTTP.Server.localAddress(server).port.value
     Shakespeare.withPage(Shakespeare.Options {}) do |browserPage|
       browserPage.goto("http://127.0.0.1:${port}/").try
       Shakespeare.expect(browserPage.locator("#status")).toHaveText("Live")
