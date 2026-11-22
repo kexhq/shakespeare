@@ -54,7 +54,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: kexhq/kex
-          ref: c7aaedf253ff71e736e3c556ddf8ea50cc974769
+          ref: 371bbdfff870bb415c276da814f6661905e81583
           path: .kex-source
 
       - name: Install Kex build dependencies
